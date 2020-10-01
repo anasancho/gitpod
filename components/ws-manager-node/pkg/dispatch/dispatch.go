@@ -1,7 +1,12 @@
+// Copyright (c) 2020 TypeFox GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License-AGPL.txt in the project root for license information.
+
 package dispatch
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -46,6 +51,7 @@ func NewDispatch(runtime cri.ContainerRuntimeInterface, kubernetes kubernetes.In
 		Kubernetes:          kubernetes,
 		KubernetesNamespace: k8sNamespace,
 		Listener:            listener,
+		NodeName:            os.Getenv("NODENAME"),
 
 		ctxs: make(map[string]*workspaceState),
 	}
@@ -60,6 +66,7 @@ type Dispatch struct {
 	CRI                 cri.ContainerRuntimeInterface
 	Kubernetes          kubernetes.Interface
 	KubernetesNamespace string
+	NodeName            string
 
 	Listener []Listener
 
@@ -69,9 +76,10 @@ type Dispatch struct {
 }
 
 type workspaceState struct {
-	Context   context.Context
-	Cancel    context.CancelFunc
-	Workspace *Workspace
+	SeenContainer bool
+	Context       context.Context
+	Cancel        context.CancelFunc
+	Workspace     *Workspace
 }
 
 type contextKey struct{}
@@ -90,14 +98,6 @@ func (d *Dispatch) Start() error {
 	ifac := informers.NewSharedInformerFactory(d.Kubernetes, podInformerResyncInterval)
 	podInformer := ifac.Core().V1().Pods().Informer()
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				return
-			}
-
-			d.handlePodAdded(pod)
-		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			oldPod, ok := oldObj.(*corev1.Pod)
 			if !ok {
@@ -149,74 +149,87 @@ func (d *Dispatch) Close() {
 	d.ctxs = make(map[string]*workspaceState)
 }
 
-func (d *Dispatch) handlePodAdded(pod *corev1.Pod) {
-	workspaceID, ok := pod.Labels[wsk8s.MetaIDLabel]
-	if !ok {
-		return
-	}
-	workspaceInstanceID, ok := pod.Labels[wsk8s.WorkspaceIDLabel]
-	if !ok {
-		return
-	}
-
-	waitForPodCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	containerCtx, containerCtxCancel := context.WithCancel(context.Background())
-	containerCtx = context.WithValue(containerCtx, contextDispatch, d)
-	go func() {
-		containerID, err := d.CRI.WaitForContainer(waitForPodCtx, workspaceInstanceID)
-		if err != nil && err != context.Canceled {
-			log.WithError(err).WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).Warn("cannot wait for container")
-		}
-
-		ws := &Workspace{
-			ContainerID: containerID,
-			InstanceID:  workspaceInstanceID,
-			WorkspaceID: workspaceID,
-			Pod:         pod,
-		}
-
-		d.mu.Lock()
-		d.ctxs[pod.Name] = &workspaceState{
-			Context:   containerCtx,
-			Cancel:    containerCtxCancel,
-			Workspace: ws,
-		}
-		d.mu.Unlock()
-
-		for _, l := range d.Listener {
-			l := l
-			go func() {
-				err := l.WorkspaceAdded(containerCtx, ws)
-				if err != nil {
-					log.WithError(err).WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).Error("dispatch listener failed")
-				}
-			}()
-		}
-	}()
-	go func() {
-		err := d.CRI.WaitForContainerStop(waitForPodCtx, workspaceInstanceID)
-		if err != nil && err != context.Canceled {
-			log.WithError(err).WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).Warn("cannot wait for container to be deleted")
-		}
-		// no matter if the container was deleted or not - we've lost our guard that was waiting for that to happen.
-		// Hence, we must stop listening for it to come into existence and cancel the context.
-		cancel()
-	}()
-}
-
 func (d *Dispatch) handlePodUpdate(oldPod, newPod *corev1.Pod) {
-	if _, ok := oldPod.Labels[wsk8s.MetaIDLabel]; !ok {
-		log.WithField("name", oldPod.Name).Debug("pod has no workspace ID - probably not a workspace. Not dispatching.")
+	workspaceID, ok := newPod.Labels[wsk8s.MetaIDLabel]
+	if !ok {
+		return
+	}
+	workspaceInstanceID, ok := newPod.Labels[wsk8s.WorkspaceIDLabel]
+	if !ok {
+		return
+	}
+	if d.NodeName != "" && newPod.Spec.NodeName != d.NodeName {
 		return
 	}
 
+	log.WithFields(wsk8s.GetOWIFromObject(&newPod.ObjectMeta)).Info("dispatch found workspace")
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	state, ok := d.ctxs[oldPod.Name]
 	if !ok {
-		log.WithFields(wsk8s.GetOWIFromObject(&oldPod.ObjectMeta)).Error("received pod update for a workspace, but have not seen it before. Ignoring update.")
+		// we haven't seen this pod before - add it, and wait for the container
+		var (
+			podName = newPod.Name
+			owi     = wsk8s.GetOWIFromObject(&newPod.ObjectMeta)
+		)
+		d.ctxs[podName] = &workspaceState{
+			SeenContainer: false,
+			Workspace: &Workspace{
+				InstanceID:  workspaceInstanceID,
+				WorkspaceID: workspaceID,
+				Pod:         newPod,
+			},
+		}
+
+		waitForPodCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		containerCtx, containerCtxCancel := context.WithCancel(context.Background())
+		containerCtx = context.WithValue(containerCtx, contextDispatch, d)
+		go func() {
+			containerID, err := d.CRI.WaitForContainer(waitForPodCtx, workspaceInstanceID)
+			if err != nil && err != context.Canceled {
+				log.WithError(err).WithFields(owi).Warn("cannot wait for container")
+			}
+			log.WithFields(owi).WithField("container", containerID).Info("dispatch found new workspace container")
+
+			d.mu.Lock()
+			s := d.ctxs[podName]
+			if s == nil {
+				log.WithFields(owi).Error("pod disappaered from dispatch state before container was ready")
+				d.mu.Unlock()
+				return
+			}
+			s.Context = containerCtx
+			s.Cancel = containerCtxCancel
+			s.Workspace.ContainerID = containerID
+			s.SeenContainer = true
+			d.mu.Unlock()
+
+			for _, l := range d.Listener {
+				l := l
+				go func() {
+					err := l.WorkspaceAdded(containerCtx, s.Workspace)
+					if err != nil {
+						log.WithError(err).WithFields(owi).Error("dispatch listener failed")
+					}
+				}()
+			}
+		}()
+		go func() {
+			// no matter if the container was deleted or not - we've lost our guard that was waiting for that to happen.
+			// Hence, we must stop listening for it to come into existence and cancel the context.
+			d.CRI.WaitForContainerStop(waitForPodCtx, workspaceInstanceID)
+			cancel()
+		}()
+
+		return
 	}
+
+	if !state.SeenContainer {
+		return
+	}
+	log.WithFields(wsk8s.GetOWIFromObject(&oldPod.ObjectMeta)).Info("received received pod update for a workspace")
+
 	state.Workspace.Pod = newPod
 
 	for _, l := range d.Listener {
@@ -246,8 +259,10 @@ func (d *Dispatch) handlePodDeleted(pod *corev1.Pod) {
 	state, ok := d.ctxs[pod.Name]
 	if !ok {
 		log.WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).Error("received pod deletion for a workspace, but have not seen it before. Ignoring update.")
+		return
 	}
-
-	state.Cancel()
+	if state.Cancel != nil {
+		state.Cancel()
+	}
 	delete(d.ctxs, pod.Name)
 }
