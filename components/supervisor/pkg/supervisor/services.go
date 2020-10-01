@@ -40,6 +40,7 @@ type RegisterableRESTService interface {
 type statusService struct {
 	IWH      *backup.InWorkspaceHelper
 	Ports    *portsManager
+	Tasks    *tasksManager
 	IDEReady <-chan struct{}
 }
 
@@ -145,6 +146,23 @@ func (s *statusService) PortsStatus(req *api.PortsStatusRequest, srv api.StatusS
 				return err
 			}
 		}
+	}
+}
+
+func (s *statusService) TasksStatus(ctx context.Context, req *api.TasksStatusRequest) (*api.TasksStatusResponse, error) {
+	select {
+	case <-s.Tasks.ready:
+		i := 0
+		tasks := make([]*api.TasksStatus, len(s.Tasks.tasks))
+		for _, task := range s.Tasks.tasks {
+			tasks[i] = task
+			i++
+		}
+		return &api.TasksStatusResponse{
+			Tasks: tasks,
+		}, nil
+	case <-ctx.Done():
+		return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
 	}
 }
 

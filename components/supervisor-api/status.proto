@@ -60,6 +60,13 @@ service StatusService {
         };
     }
 
+    // TasksStatus provides currently running tasks.
+    rpc TasksStatus(TasksStatusRequest) returns (TasksStatusResponse) {
+        option (google.api.http) = {
+            get: "/v1/status/tasks"
+        };
+    }
+
 }
 
 message SupervisorStatusRequest {}
@@ -118,4 +125,16 @@ message PortsStatus {
     uint32 local_port = 1;
 
     uint32 global_port = 2;
+}
+
+message TasksStatusRequest {    
+}
+message TasksStatusResponse {
+    repeated TasksStatus tasks = 1;
+}
+message TasksStatus {
+    string alias = 1;
+    string name = 2;
+    string open_in = 3;
+    string open_mode = 4;
 }

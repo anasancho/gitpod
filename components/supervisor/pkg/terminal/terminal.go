@@ -21,14 +21,22 @@ import (
 // NewMux creates a new terminal mux
 func NewMux() *Mux {
 	return &Mux{
-		terms: make(map[string]*term),
+		terms: make(map[string]*Term),
 	}
 }
 
 // Mux can mux pseudo-terminals
 type Mux struct {
-	terms map[string]*term
+	terms map[string]*Term
 	mu    sync.RWMutex
+}
+
+// Get returns a terminal for the given alias
+func (m *Mux) Get(alias string) (*Term, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	term, ok := m.terms[alias]
+	return term, ok
 }
 
 // Start starts a new command in its own pseudo-terminal and returns an alias
@@ -94,13 +102,13 @@ func (m *Mux) Close(alias string) error {
 	return nil
 }
 
-func newTerm(pty *os.File, cmd *exec.Cmd) (*term, error) {
+func newTerm(pty *os.File, cmd *exec.Cmd) (*Term, error) {
 	token, err := uuid.NewRandom()
 	if err != nil {
 		return nil, err
 	}
 
-	res := &term{
+	res := &Term{
 		PTY:     pty,
 		Command: cmd,
 		Stdout:  &multiWriter{listener: make(map[*multiWriterListener]struct{})},
@@ -111,7 +119,8 @@ func newTerm(pty *os.File, cmd *exec.Cmd) (*term, error) {
 	return res, nil
 }
 
-type term struct {
+// Term is a pseudo-terminal
+type Term struct {
 	PTY          *os.File
 	Command      *exec.Cmd
 	Title        string

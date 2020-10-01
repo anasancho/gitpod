@@ -11,7 +11,6 @@
 import { ContainerModule } from "inversify";
 import { GitPodExpressService } from './gitpod-express-service';
 import { BackendApplicationContribution } from "@theia/core/lib/node/backend-application";
-import { GitpodTaskStarter, TheiaLocalTaskStarter, WorkspaceReadyTaskStarter } from './gitpod-task-starter';
 import { GitpodFileParser } from '@gitpod/gitpod-protocol/lib/gitpod-file-parser';
 
 import { GitpodInfoProviderNodeImpl } from "./gitpod-info-backend";
@@ -37,13 +36,9 @@ import { GitpodPluginLocatorClient } from "./extensions/gitpod-plugin-locator-cl
 import { HostedPluginReader } from "@theia/plugin-ext/lib/hosted/node/plugin-reader";
 import { GitpodPluginReader } from "./extensions/gitpod-plugin-reader";
 import { gitpodInfoPath } from "../common/gitpod-info";
-import { ContentReadyServiceServer, ContentReadyServiceClient, ContentReadyService } from "../common/content-ready-service";
-import { ContentReadyServiceServerImpl } from "./content-ready-service-server";
-import { Deferred } from "@theia/core/lib/common/promise-util";
 import { OpenVSXExtensionProviderImpl } from "./extensions/openvsx-extension-provider-impl";
 import { openVSXExtensionProviderPath } from "../common/openvsx-extension-provider";
 import { EnvVariablesServer } from "@theia/core/lib/common/env-variables";
-import { RemoteFileSystemServer, FileSystemProviderServer } from "@theia/filesystem/lib/common/remote-file-system-provider";
 import { SupervisorServedPortsServiceImpl } from "./supervisor-serverd-ports-service";
 import { SupervisorClientProvider } from "./supervisor-client-provider";
 
@@ -53,13 +48,6 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
     rebind(ILoggerServer).to(JsonConsoleLoggerServer).inSingletonScope();
 
     bind(GitpodFileParser).toSelf().inSingletonScope();
-    bind(GitpodTaskStarter).toSelf().inSingletonScope();
-    bind(BackendApplicationContribution).to(WorkspaceReadyTaskStarter).inSingletonScope();
-
-    if (process.env['THEIA_LOCAL']) {
-        // in theia local mode, no signal is coming from syncd, so we want to launch the tasks on start.
-        bind(BackendApplicationContribution).to(TheiaLocalTaskStarter);
-    }
 
     bind(GitPodExpressService).toSelf().inSingletonScope();
     bind(BackendApplicationContribution).toService(GitPodExpressService);
@@ -87,42 +75,9 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
 
     if (!process.env['THEIA_LOCAL']) {
         rebind(EnvVariablesServer).to(GitpodEnvVariablesServer).inSingletonScope();
-        rebind(RemoteFileSystemServer).toDynamicValue(context => {
-            const server = context.container.get(FileSystemProviderServer);
-            const contentReadyServer: ContentReadyServiceServer = context.container.get(ContentReadyServiceServer);
-            const ready = new Deferred();
-            contentReadyServer.setClient({
-                onContentReady() {
-                    ready.resolve();
-                    return Promise.resolve();
-                }
-            });
-            const get: (target: any, prop: any) => any = (target: any, prop: any) => {
-                const orig = target[prop];
-                if (typeof orig === 'function') {
-                    return (...args: any[]) => {
-                        return ready.promise.then(() => {
-                            return orig.apply(target, args);
-                        });
-                    }
-                }
-                return orig;
-            };
-            return new Proxy(server, { get });
-        });
     }
 
     rebind(HostedPluginReader).to(GitpodPluginReader).inSingletonScope();
-
-    bind(ContentReadyServiceServer).to(ContentReadyServiceServerImpl).inSingletonScope();
-    bind(ConnectionHandler).toDynamicValue(context =>
-        new JsonRpcConnectionHandler<ContentReadyServiceClient>(ContentReadyService.SERVICE_PATH, client => {
-            const server = context.container.get<ContentReadyServiceServer>(ContentReadyServiceServer);
-            server.setClient(client);
-            client.onDidCloseConnection(() => server.disposeClient(client));
-            return server;
-        })
-    ).inSingletonScope();
 
     bind(GitpodPluginDeployerHandler).toSelf().inSingletonScope();
     rebind(HostedPluginDeployerHandler).toService(GitpodPluginDeployerHandler);
